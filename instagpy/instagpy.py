@@ -10,6 +10,7 @@ from . import session_util
 from . import utils
 from . import path
 from .request_util import make_request
+from functools import reduce
 
 
 class InstaGPy:
@@ -57,6 +58,13 @@ class InstaGPy:
         """
         response = make_request(path.META_DATA_URL)
         return response
+    
+    def login_decorator(original_function):
+        def wrapper(self, *args, **kwargs):
+            if not self.logged_in:
+                self.login()
+            return original_function(self, *args, **kwargs)
+        return wrapper
 
     def generate_session(self, session_id=None):
         """Generates Required Headers and Cookies. OR Generates Session from an existing Session ID.
@@ -72,12 +80,13 @@ class InstaGPy:
             {"User-Agent": random.choice(config._USER_AGENTS)})
         make_request(path.BASE_URL, session=self.session)
         response = requests.get(path.LOGIN_URL)
-        if not response.cookies:
-            for _ in range(config.MAX_RETRIES):
-                response = self.session.get(path.LOGIN_URL)
-                if response.cookies:
-                    break
-        csrf_token = dict(response.cookies)["csrftoken"]
+        for _ in range(config.MAX_RETRIES):
+            if response.cookies:
+                break
+            response = self.session.get(path.LOGIN_URL)
+        csrf_token = dict(response.cookies).get("csrftoken",None)
+        if not csrf_token:
+            raise Exception("Couldn't generate CSRF Token")
         self.session.headers.update(
             {'x-csrftoken': csrf_token, 'X-Requested-With': "XMLHttpRequest", 'Referer': path.BASE_URL})
         self.session.cookies = response.cookies
@@ -91,6 +100,68 @@ class InstaGPy:
             pass
         config._DEFAULT_SESSION = self.session
         return self.session
+    
+    def _handle_pagination(self, data_path=None, total=None, from_date=None, to_date=None, data_count=None, request_config=None, pagination=True):
+        # fmt: off  - Turns off formatting for this block of code. Just for the readability purpose.
+        def filter_data(response):
+            filtered_data = []
+            for each_entry in response:
+                if from_date or to_date:
+                    created_at = datetime.datetime.fromtimestamp(each_entry.get("node",{}).get("taken_at_timestamp"))
+                if from_date and created_at and created_at <= from_date:
+                    continue
+                if to_date and created_at and created_at >= to_date:
+                    continue
+                if total is not None and (len(data_container['data']) + len(filtered_data)) >= total:
+                    return filtered_data
+                filtered_data.append(each_entry)
+            return filtered_data
+        
+        if not request_config or not isinstance(request_config, dict):
+            raise Exception("Invalid request config")
+        if not data_path:
+            raise Exception("No data path specified")
+        if not pagination and total:
+            raise Exception("Either enable the pagination or disable total number of results.")
+        data_container = {"data": [],"end_cursor": None, "has_next_page": True}
+        while data_container["has_next_page"]:
+            try:
+                request_payload = self._generate_request_data(**request_config)
+                response = make_request(**request_payload)
+                data = reduce(dict.get, data_path, response)
+                end_cursor = data.get("page_info",{}).get("end_cursor",None) if isinstance(data, dict) else None or response.get("next_max_id",None)
+                has_next_page = data.get("page_info",{}).get("has_next_page",None) if isinstance(data, dict) else None or response.get("big_list", None)
+                if not data_count:
+                    data_count = data.get("count","") if isinstance(data, dict) else ""
+                if isinstance(data, dict):
+                    data = data.get('edges',[])
+                data_container['data'].extend(filter_data(data))
+                
+                print(f"Fetched Data : {len(data_container['data'])} / {data_count}".strip(" /"), end="\r")
+
+                if end_cursor:
+                    request_config['end_cursor'] = end_cursor
+                    data_container['end_cursor'] = end_cursor
+
+                if not has_next_page:
+                    data_container["has_next_page"] = False
+
+                if not data_container["has_next_page"] or (total is not None and len(data_container['data']) >= total) or not pagination:
+                    return data_container
+                
+                if from_date:
+                    if any(datetime.datetime.fromtimestamp(post['node']['taken_at_timestamp']) <= from_date for post in data['edges']):
+                        return data_container
+                
+                self.shuffle_session()
+            # fmt: on 
+            except ConnectionError as error:
+                print(error)
+                continue
+
+            except Exception as error:
+                print(error)
+                return data_container
 
     def shuffle_session(self, ignore_requests_limit=False):
         """Shuffle session/cookies. Takes a new session ID from self.session_ids if using with mutiple accounts.
@@ -118,10 +189,11 @@ class InstaGPy:
             session_id = self.session_ids_container.pop()
             return self.generate_session(session_id=session_id)
 
-    def generate_query(self, query=None, count=None, user_id=None, end_cursor=None, search_surface=None, shortcode=None, hashtag=None, is_graphql=False):
-        """Generates query paramters for instagram api requests.
+    def _generate_request_data(self, url=None, query=None, count=None, user_id=None, end_cursor=None, search_surface=None, shortcode=None, hashtag=None, is_graphql=False):
+        """Generates request payload for instagram api requests.
 
         Args:
+            url (str, optional): Request URL. Defaults to None.
             query (str, optional): Query endpoint. Defaults to None.
             count (int, optional): Number of results per request to extract from Instagram Database. Defaults to None.
             user_id (int, optional): User Profile ID. Defaults to None.
@@ -131,7 +203,7 @@ class InstaGPy:
             is_graphql (bool, optional): If its a Graphql query or standard request. Defaults to False.
 
         Returns:
-            dict: query paramters
+            dict: request payload
         """
         params = {}
         if is_graphql:
@@ -156,8 +228,9 @@ class InstaGPy:
                 params["search_surface"] = search_surface
             if end_cursor is not None:
                 params["max_id"] = end_cursor
-
-        return params
+                
+        request_payload = {"url": url or path.GRAPHQL_URL, "params": params}
+        return request_payload
 
     def login(self, username=None, password=None, show_saved_sessions=False, save_session=True):
         """Login Into a user account for Data Scraping Purpose.
@@ -217,11 +290,12 @@ class InstaGPy:
                         session_util.save_session(
                             session=self.session, filename=username)
                     return
-                raise Exception("Couldn't Login, Try again...")
+                raise Exception("Couldn't Authenticate the user, Try again...",)
             except Exception as error:
-                print('\n', error)
+                print(f"\n{error}")
                 utils.check_for_errors(user)
 
+    @property
     def logged_in(self):
         """Check if user is logged in.
 
@@ -246,13 +320,13 @@ class InstaGPy:
         if new_session:
             self.generate_session()
             self.login(username, password)
-        if self.logged_in():
+        if self.logged_in:
             return self.session.cookies['sessionid']
         raise Exception(
             "You are not logged In. Set new_session=True to generate a new session.")
 
     def get_user_id(self, username):
-        if isinstance(username, int) or username.isnumeric():
+        if isinstance(username, int) or isinstance(username,str) and username.isnumeric():
             return username
         return self.get_user_info(username)['data']['user']['id']
 
@@ -269,6 +343,7 @@ class InstaGPy:
         self.shuffle_session()
         return response
 
+    @login_decorator
     def get_user_data(self, user_id):
         """Extracts user details. With Contact Info Like email, phone and address.
 
@@ -279,8 +354,6 @@ class InstaGPy:
             dict: user info along with contact info.
         """
         # returns almost as same data as get_user_info method Except this one returns contact info (email/phone) as well. |LOGIN REQUIRED|
-        if not self.logged_in():
-            self.login()
         user_id = self.get_user_id(user_id)
         response = make_request(path.USER_DATA_ENDPOINT.format(user_id))
         self.shuffle_session()
@@ -315,7 +388,8 @@ class InstaGPy:
                 print(f"{key} : {value}")
         return user
 
-    def get_user_friends(self, username, followers_list=False, followings_list=False, end_cursor=None, total=None):
+    @login_decorator
+    def get_user_friends(self, username, followers_list=False, followings_list=False, end_cursor=None, total=None, pagination=True):
         """Fetch follower or following list of a user.
 
         Args:
@@ -324,76 +398,40 @@ class InstaGPy:
             followings_list (bool, optional): Set True if want to extract user's followings list. Defaults to False.
             end_cursor (str, optional): Last endcursor point. (To start from where you left off last time). Defaults to None.
             total (int, optional): Total number of results to extract. Defaults to None. -- Gets all by default.
+            pagination (bool, optional): Set to False if want to handle each page request manually. Use end_cursor from the previous page/request to navigate to the next page. Defaults to True.
 
         Returns:
-            list: All followers or followings.
+            dict: Returns data, end_cursor, has_next_page
         """
-        def filter_data(response):
-            filtered_data = []
-            for each_entry in response:
-                if total is not None and (len(user_friends) + len(filtered_data)) >= total:
-                    return filtered_data
-                filtered_data.append(each_entry)
-            return filtered_data
         if (not followers_list and not followings_list) or (followers_list and followings_list):
             raise Exception(
                 "Set either the followers_list or the followings_list to True.")
-        if not self.logged_in():
-            self.login()
         user = self.get_user_basic_details(username)
-        count = user['follower_count'] if followers_list else user['following_count'] if followings_list else None
+        data_count = user['follower_count'] if followers_list else user['following_count'] if followings_list else None
 
         if user['is_private']:
             raise Exception("Account is Private.")
 
-        user_friends = []
-        print(f'Started at : {utils.format_datetime(time.time())}\n')
-        while True:
-            if followers_list and user['is_verified']:
-                url = path.GRAPHQL_URL
-                max_data = 50
-                query_params = self.generate_query(query=path.FOLLOWERS_LIST_QUERY, count=max_data, user_id=user['id'],
-                                                   end_cursor=end_cursor, search_surface="follow_list_page", is_graphql=True)
-            else:
-                if followers_list:
-                    url = path.USER_FOLLOWERS_ENDPOINT.format(user['id'])
-                    max_data = 100
-                elif followings_list:
-                    url = path.USER_FOLLOWINGS_ENDPOINT.format(user['id'])
-                    max_data = 200
-                query_params = self.generate_query(
-                    count=max_data, end_cursor=end_cursor)
+        request_config = {}
+        if followers_list and user['is_verified']:
+            url = path.GRAPHQL_URL
+            max_data = 50
+            data_path = ('data', 'user', 'edge_followed_by')
+            request_config = request_config | {"query": path.FOLLOWERS_LIST_QUERY, "count": max_data, "user_id": user['id'],
+                               "end_cursor": end_cursor, "search_surface":"follow_list_page", "is_graphql":True}
+        else:
+            if followers_list:
+                url = path.USER_FOLLOWERS_ENDPOINT.format(user['id'])
+                max_data = 100
+            elif followings_list:
+                url = path.USER_FOLLOWINGS_ENDPOINT.format(user['id'])
+                max_data = 200
+            data_path = ("users",)
+            request_config = request_config | {"count": max_data, "end_cursor": end_cursor}
+        request_config = request_config | {"url": url}
+        return self._handle_pagination(data_path=data_path, total=total, request_config=request_config, data_count=data_count, pagination=pagination)
 
-            try:
-                response = make_request(url, params=query_params)
-                if followers_list and user['is_verified']:
-                    data = response['data']['user']['edge_followed_by']
-                    has_next_page = data['page_info']['has_next_page']
-                    end_cursor = data['page_info']['end_cursor']
-                    data = data['edges']
-                else:
-                    data = response['users']
-                    if 'next_max_id' in response.keys():
-                        end_cursor = response['next_max_id']
-                    has_next_page = response['big_list']
-                user_friends.extend(filter_data(data))
-
-                print(
-                    f"{user['username']} : {len(user_friends)} / {count}", end="\r")
-                if not has_next_page or (total is not None and len(user_friends) >= total):
-                    return user_friends
-
-                self.shuffle_session()
-
-            except ConnectionError as error:
-                print(error)
-                continue
-
-            except Exception as error:
-                print(error)
-                return user_friends
-
-    def get_profile_media(self, username, end_cursor=None, from_date=None, to_date=None, total=None):
+    def get_profile_media(self, username, end_cursor=None, from_date=None, to_date=None, total=None, pagination=True):
         """Returns all media/posts of the given Instagram Profile.
 
         Args:
@@ -402,72 +440,20 @@ class InstaGPy:
             from_date (str, optional): FORMAT - 'Year-Month-Date' Fetch posts starting from a specified period of time. Defaults to None.
             to_date (str, optional): FORMAT - 'Year-Month-Date'  Fetch posts upto a specified period of time. Defaults to None.
             total (int, optional): Total number of results to extract. Defaults to None. -- Gets all by default.
+            pagination (bool, optional): Set to False if want to handle each page request manually. Use end_cursor from the previous page/request to navigate to the next page. Defaults to True.
 
         Returns:
-            list: All Posts of the given Instagram user.
+            dict: Returns data, end_cursor, has_next_page
         """
-        def filter_by_date(user_posts):
-            posts_data = []
-            for each_post in user_posts:
-                post_date = datetime.datetime.fromtimestamp(
-                    each_post['node']['taken_at_timestamp'])
-                if from_date is not None:
-                    if post_date <= from_date:
-                        continue
-                if to_date is not None:
-                    if post_date >= to_date:
-                        continue
-                posts_data.append(each_post)
-                if total is not None and (len(user_posts_data) + len(posts_data)) >= total:
-                    return posts_data
-            return posts_data
 
-        user = self.get_user_basic_details(username)
-        user_id = user['id']
-        user_posts_data = []
+        user_id = self.get_user_id(username)
         if from_date is not None:
-            from_date = utils.parse_datetime(from_date)
-            from_date = from_date + datetime.timedelta(days=1)
+            from_date = utils.parse_datetime(from_date) + datetime.timedelta(days=1)
         if to_date is not None:
-            to_date = utils.parse_datetime(to_date)
-            to_date = to_date + datetime.timedelta(days=1)
-        print(f'Started at : {utils.format_datetime(time.time())}\n')
-        try:
-            while True:
-                query_params = self.generate_query(
-                    query=path.USER_FEED_QUERY, user_id=user_id, count=50, end_cursor=end_cursor, is_graphql=True)
-                try:
-                    response = make_request(
-                        path.GRAPHQL_URL, params=query_params)
-                    data = response['data']['user']['edge_owner_to_timeline_media']
-                    posts_count = data['count']
-                    has_next_page = data['page_info']['has_next_page']
-                    cursor = data['page_info']['end_cursor']
-                    if cursor:
-                        end_cursor = cursor
-                    user_posts_data.extend(filter_by_date(data['edges']))
-                    print(
-                        f"{username} : {len(user_posts_data)} of {posts_count}", end="\r")
-
-                except ConnectionError as error:
-                    print(error)
-                    continue
-
-                except Exception as error:
-                    print(error)
-                    return user_posts_data
-
-                if from_date:
-                    if any(datetime.datetime.fromtimestamp(post['node']['taken_at_timestamp']) <= from_date for post in data['edges']):
-                        return user_posts_data
-
-                if not has_next_page or (total is not None and len(user_posts_data) >= total):
-                    return user_posts_data
-
-                self.shuffle_session()
-
-        except Exception as e:
-            print(e)
+            to_date = utils.parse_datetime(to_date) + datetime.timedelta(days=1)
+        request_config = {"query": path.USER_FEED_QUERY, "user_id": user_id, "count": 50, "end_cursor": end_cursor, "is_graphql": True}
+        data_path = ('data', 'user', 'edge_owner_to_timeline_media')
+        return self._handle_pagination(data_path=data_path, total=total, from_date=from_date, to_date=to_date, request_config=request_config, pagination=pagination)
 
     def get_post_details(self, post_url):
         """Get details of a particular Instagram Post/Media.
@@ -479,10 +465,9 @@ class InstaGPy:
             dict: All the details like post_id,datetime,caption,url,location etc.
         """
         post_id = utils.get_post_id(post_url)
-        url = path.GRAPHQL_URL
-        query_params = self.generate_query(
+        request_payload = self._generate_request_data(
             query=path.POST_DETAILS_QUERY, shortcode=post_id, is_graphql=True)
-        response = make_request(url, params=query_params)
+        response = make_request(**request_payload)
         self.shuffle_session()
         return response
 
@@ -505,6 +490,7 @@ class InstaGPy:
                 return [each_carousel['node']['display_resources'][-1]['src'] for each_carousel in response['data']['shortcode_media']['edge_sidecar_to_children']["edges"]]
         return None
 
+    @login_decorator
     def get_about_user(self, username, print_formatted=True):
         """Returns user about details like account location, if running any ads, verified, Joining Date, Verification Date.
 
@@ -515,8 +501,6 @@ class InstaGPy:
         Returns:
             dict: User About Dataset.
         """
-        if not self.logged_in():
-            self.login()
         user_id = self.get_user_id(username)
         data = {'referer_type': 'ProfileUsername', 'target_user_id': user_id, 'bk_client_context': {
             'bloks_version': path.ABOUT_USER_QUERY, 'style_id': 'instagram'}, 'bloks_versioning_id': path.ABOUT_USER_QUERY}
@@ -526,7 +510,8 @@ class InstaGPy:
         self.shuffle_session()
         return response
 
-    def get_hashtag_posts(self, hashtag=None, end_cursor=None, total=None):
+    @login_decorator
+    def get_hashtag_posts(self, hashtag=None, end_cursor=None, total=None, pagination=True):
         """Get media posts from hashtags.
 
         Args:
@@ -534,53 +519,18 @@ class InstaGPy:
             hashtag (str): Hashtag that you want to extract data from. Accepts both formats i.e. hashtag or
             end_cursor (str, optional): Last endcursor point. (To start from where you left off last time). Defaults to None.
             total (int, optional): Total number of results to extract. Defaults to None. -- Gets all by default.
+            pagination (bool, optional): Set to False if want to handle each page request manually. Use end_cursor from the previous page/request to navigate to the next page. Defaults to True.
 
         Returns:
-            dict: Hashtag posts data.
+            dict: Returns data, end_cursor, has_next_page
         """
-        def filter_data(response):
-            filtered_data = []
-            for each_entry in response:
-                if total is not None and (len(hashtag_posts) + len(filtered_data)) >= total:
-                    return filtered_data
-                filtered_data.append(each_entry)
-            return filtered_data
         if hashtag is None:
             raise Exception("No hashtag was given.")
-        if not self.logged_in():
-            self.login()
         hashtag = hashtag.lstrip("#")
-        hashtag_posts = []
-        url = path.GRAPHQL_URL
-        max_data = 50
-        print(f'Started at : {utils.format_datetime(time.time())}\n')
-        while True:
-            query_params = self.generate_query(
-                query=path.HASHTAG_QUERY, hashtag=hashtag, count=max_data, end_cursor=end_cursor, is_graphql=True)
+        request_config = {"query": path.HASHTAG_QUERY, "hashtag": hashtag, "count": 50, "end_cursor": end_cursor, "is_graphql": True}
+        data_path = ('data', 'hashtag', 'edge_hashtag_to_media')
+        return self._handle_pagination(data_path=data_path, total=total, request_config=request_config, pagination=pagination)
 
-            try:
-                response = make_request(url, params=query_params)
-                data = response['data']['hashtag']['edge_hashtag_to_media']
-                has_next_page = data['page_info']['has_next_page']
-                end_cursor = data['page_info']['end_cursor']
-                count = data['count']
-                data = data['edges']
-
-                hashtag_posts.extend(filter_data(data))
-                print(
-                    f"#{hashtag} : {len(hashtag_posts)} / {count}", end="\r")
-                if not has_next_page or (total is not None and len(hashtag_posts) >= total):
-                    return hashtag_posts
-
-                self.shuffle_session()
-
-            except ConnectionError as error:
-                print(error)
-                continue
-
-            except Exception as error:
-                print(error)
-                return hashtag_posts
 
 
 if __name__ == "__main__":
